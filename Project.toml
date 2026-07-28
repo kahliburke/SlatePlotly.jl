@@ -1,0 +1,28 @@
+name = "SlatePlotly"
+uuid = "141e1fc3-13f6-4de8-b22a-97670e9194c6"
+authors = ["Kahli Burke <kahli@kahliburke.com>"]
+version = "0.1.0"
+
+[deps]
+Artifacts = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
+Downloads = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+PlotlyBase = "a03496cd-edff-5a9b-9e67-9cda94a718b5"
+SlateExtensionsBase = "bc31d39e-4442-48fa-b9ae-1bd99fed63f7"
+
+# SlateExtensionsBase is not registered — it ships inside the KaimonSlate repo, which is where the
+# widget/asset/render contract is defined. Points at the same checkout Slate itself resolves.
+[sources]
+SlateExtensionsBase = {path = "../KaimonSlate.jl/lib/SlateExtensionsBase"}
+
+[compat]
+JSON = "0.21, 1"
+PlotlyBase = "0.8"
+SlateExtensionsBase = "0.1"
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
