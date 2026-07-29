@@ -90,6 +90,10 @@
         border = v('--border', '#2a2e40'), bg2 = v('--bg2', '#141828');
     var family = (getComputedStyle(document.body || document.documentElement).fontFamily || '').trim() ||
                  'system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
+    // `automargin` on here is the STARTING state, not the running one: it is the only thing that measures
+    // the drawn text, so a figure needs it to find its margins the first time, and turning it off outright
+    // would trade a flicker for a clipped axis. `remeasureMargins` takes it away again as soon as it has
+    // answered, and puts it back only when the figure is at rest — see the note there for why.
     var axis = {
       gridcolor: border, zerolinecolor: border, linecolor: border, tickcolor: border,
       tickfont: { color: dim, size: 13 },
@@ -134,17 +138,69 @@
     return out;
   }
 
+  // ── The reader's view, across a REMOUNT ─────────────────────────────────────────────────────────
+  // `keptRanges` carries a zoom through a `Plotly.react`, which covers an update drawn into the same
+  // node. It cannot cover a remount — and moving a `@bind` is a remount: Slate re-renders the cell and
+  // hands the widget a brand new element, whose `_fullLayout` has never been zoomed. There is nothing
+  // left to read, so the reader is bounced back to the full extent by the very control they were using
+  // to compare against it.
+  //
+  // So the view is remembered OUTSIDE the element too, keyed by WHERE the figure sits rather than by
+  // whichever node currently happens to be showing it.
+  var VIEWS = {};
+
+  function viewKey(el) {
+    var cell = el.closest && el.closest('[id^="cell-"]');
+    if (!cell) return null;
+    // Position within the cell, so a cell holding several figures keeps them apart. The class is added
+    // before the first draw, so a remounted node is already findable here.
+    var peers = cell.querySelectorAll('.plotly-graph-div');
+    var i = Array.prototype.indexOf.call(peers, el);
+    return cell.id + '#' + (i < 0 ? 0 : i);
+  }
+
+  function rememberView(el) {
+    var k = viewKey(el);
+    if (!k) return;
+    var kept = keptRanges(el);
+    // Nothing manual left means the reader RESET the view (modebar home, double-click). Forget it, so a
+    // stale zoom is never re-imposed on someone who deliberately zoomed back out.
+    if (Object.keys(kept).length) VIEWS[k] = kept; else delete VIEWS[k];
+  }
+
+  function rememberedView(el) {
+    var k = viewKey(el);
+    return (k && VIEWS[k]) || null;
+  }
+
   function themed(layout, el) {
     var l = Object.assign({}, layout || {});
     var t = themeLayout();
     // An author who set an explicit range in Julia means it, and that wins. Otherwise a view the reader
-    // established survives the update.
+    // established survives the update — read from the live element when there is one to read (an update
+    // in place), and otherwise from what this figure's position last recorded (a remount, where the
+    // element is new and remembers nothing).
     var kept = keptRanges(el);
+    if (!Object.keys(kept).length) kept = rememberedView(el) || {};
     Object.keys(kept).forEach(function (k) {
       if (!l[k] || (l[k].range === undefined && l[k].autorange === undefined)) {
         l[k] = Object.assign({}, l[k] || {}, kept[k]);
       }
     });
+    // The margin floor travels with the layout for the same reason the reader's ranges do: `Plotly.react`
+    // rebuilds from the spec, and the spec carries no margin — so without this every re-render would drop
+    // the floor and re-run the ratchet from nothing, which is a visible twitch on each step of a slider
+    // drag. An author who set their own margin still wins.
+    var m = el && el.__slateMargin;
+    if (m && !l.margin) {
+      l.margin = { l: m.l, r: m.r, t: m.t, b: m.b };
+      // And automargin goes back off with it. The template's default is ON — that is how a figure gets
+      // measured the first time — so a re-render would otherwise switch it back on and re-open the loop
+      // until the next settle, which is precisely a slider drag's worth of pushed-and-pulled labels.
+      // `themeLayout` hands xaxis and yaxis the same object; both are set for the reader, not the runtime.
+      t.xaxis.automargin = false;
+      t.yaxis.automargin = false;
+    }
     if (!l.template) l.template = { layout: t };
     // Hover labels are the one thing a template does NOT settle. Plotly derives a label's background
     // from the TRACE's colour unless the LAYOUT overrides it, and a template loses that contest — so a
@@ -152,6 +208,103 @@
     // still yielding to an author who specified their own.
     if (!l.hoverlabel) l.hoverlabel = t.hoverlabel;
     return l;
+  }
+
+  // ── Margins that cannot move under a gesture ────────────────────────────────────────────────────
+  // Plotly's `automargin` sizes the margin from the tick labels it drew. But the margin sizes the plot
+  // AREA, and the plot area's pixel width is what decides which tick set gets drawn next. That is a loop:
+  // zoom re-picks the ticks → the labels change width → the margin moves → the plot area resizes → the
+  // ticks are re-picked. It has enough gain to flip between two states, and plotly only CAPS the churn
+  // rather than preventing it ("Too many auto-margin redraws", then it stops wherever it happens to be).
+  //
+  // A floor under `layout.margin` does NOT close this: automargin's push is applied on top of the margin,
+  // so a minimum can't stop it growing — and the correction lands mid-gesture, tearing down the fast path
+  // plotly uses for a scroll zoom. That is the labels being pushed and pulled exactly as the grid flips.
+  //
+  // So automargin is demoted from a running policy to a MEASURING INSTRUMENT. It is switched on only
+  // while the figure is at rest, long enough to answer "how much room does this actually need", and the
+  // answer is then pinned as an explicit margin with automargin off. During a gesture there is no
+  // automargin at all, so there is no loop to oscillate and nothing that can relayout: the grid may flip
+  // and the labels may change text, but the layout around them is frozen.
+  //
+  // The pinned value is also QUANTIZED and RATCHETED, so the at-rest measurement settles instead of
+  // creeping. Quantized: it moves in whole steps, and automargin's perturbations are the width difference
+  // between adjacent tick sets ("0.5" vs "0.55"), a few pixels — below one step they change nothing.
+  // Ratcheted: within a mounted figure it only ever grows, and a monotone sequence bounded by the
+  // container must terminate. Worst case it settles one step wider than needed, which is not visible.
+  var MARGIN_STEP = 16;      // px; comfortably wider than the tick-set perturbations above
+  var SETTLE_MS = 200;       // quiet time that counts as "the reader has stopped"
+
+  // Every cartesian axis, not just the first pair — a figure with subplots has `xaxis2`, `yaxis3`, and an
+  // axis left on automargin is an axis still in the loop. Same test `keptRanges` uses.
+  function axisKeys(el) {
+    var fl = el._fullLayout || {};
+    return Object.keys(fl).filter(function (k) { return /^[xy]axis\d*$/.test(k); });
+  }
+
+  function setAutomargin(el, on) {
+    var patch = {};
+    axisKeys(el).forEach(function (k) { patch[k + '.automargin'] = on; });
+    return Object.keys(patch).length ? window.Plotly.relayout(el, patch) : Promise.resolve();
+  }
+
+  // Hand the job back to plotly briefly, read what it decided, pin it, take it away again. Reusing its
+  // measurement rather than reading the SVG ourselves: automargin is the thing that knows how wide the
+  // text came out, and its correctness was never the problem — only its timing.
+  function remeasureMargins(el) {
+    if (!window.Plotly || !el._fullLayout || el.__slateRemeasuring) return Promise.resolve();
+    // A figure that draws while hidden or collapsed has no width to measure against, and plotly has
+    // fallen back to its own default canvas — pinning THAT would reserve margins for a 700px figure and
+    // freeze them there once the element is finally shown. Leave it unpinned; becoming visible resizes
+    // the figure, which relayouts, which schedules a measure with real geometry.
+    if (!el.clientWidth || !el.offsetParent) return Promise.resolve();
+    el.__slateRemeasuring = true;
+    return setAutomargin(el, true).then(function () {
+      var size = el._fullLayout._size, prev = el.__slateMargin || {}, next = {};
+      ['l', 'r', 't', 'b'].forEach(function (k) {
+        var need = Math.ceil(size[k] / MARGIN_STEP) * MARGIN_STEP;
+        next[k] = Math.max(need, prev[k] || 0);     // the ratchet: never hand space back mid-view
+      });
+      el.__slateMargin = next;
+      var patch = { 'margin.l': next.l, 'margin.r': next.r, 'margin.t': next.t, 'margin.b': next.b };
+      axisKeys(el).forEach(function (k) { patch[k + '.automargin'] = false; });
+      return window.Plotly.relayout(el, patch);
+    }).catch(function () { /* a figure torn down mid-measure — nothing to pin */ })
+      .then(function () { el.__slateRemeasuring = false; });
+  }
+
+  // Re-measure only once the figure has been quiet for a beat. Relayouts we cause ourselves are excluded
+  // by the `__slateRemeasuring` guard; without it the measure would retrigger its own timer forever.
+  function scheduleRemeasure(el) {
+    if (el.__slateRemeasuring) return;
+    clearTimeout(el.__slateMarginTimer);
+    el.__slateMarginTimer = setTimeout(function () { remeasureMargins(el); }, SETTLE_MS);
+  }
+
+  // A gesture is IN FLIGHT — cancel any pending measure outright.
+  //
+  // This is the event that matters, and getting it wrong is what made the judder. During a continuous
+  // wheel plotly emits `plotly_relayouting` throughout and `plotly_relayout` only when it commits, so a
+  // settle timer pushed out by the COMMIT alone expires in the middle of the gesture. Measuring there is
+  // not a cosmetic mistake: turning automargin back on issues a `Plotly.relayout`, which discards the
+  // in-flight scroll-box transform and re-reads the last committed range — the view snaps back to where
+  // the gesture started, then jumps forward again on the next commit. `relayouting` is the only signal
+  // that means "the reader's hand is still moving", so it is the one that has to hold the measure off.
+  function gestureActive(el) {
+    clearTimeout(el.__slateMarginTimer);
+    el.__slateMarginTimer = 0;
+  }
+
+  // Registered once per element — `plotly_relayout` handlers accumulate across `Plotly.react` calls
+  // otherwise, and N copies would each schedule their own measure.
+  function watchMargins(el) {
+    if (el.__slateMarginWatched || !el.on) return;
+    el.__slateMarginWatched = true;
+    // `relayout` is the COMMIT — a settled view, and the only safe moment to arm a measure. It is also
+    // where the reader's view is recorded, so a remount a moment later can put it back.
+    el.on('plotly_relayout', function () { rememberView(el); scheduleRemeasure(el); });
+    // `relayouting` fires throughout a live gesture; it disarms.
+    el.on('plotly_relayouting', function () { gestureActive(el); });
   }
 
   // ── Spec ────────────────────────────────────────────────────────────────────────────────────────
@@ -188,6 +341,11 @@
     }).then(function () {
       var frames = (el.__slatePlotlySpec || {}).frames;
       if (frames && frames.length) return window.Plotly.addFrames(el, frames);
+    }).then(function () {
+      // Pin the margin from the FIRST draw, before the reader can touch anything — a gesture must never
+      // be the thing that discovers the figure still had automargin live on it.
+      watchMargins(el);
+      return remeasureMargins(el);
     }).catch(function (e) { fail(el, e); });
   }
 
@@ -219,90 +377,22 @@
   }
 
   // ── Replay: a control driving shipped data, with no kernel ──────────────────────────────────────
-  // Live, moving a `@bind` re-runs the cell in Julia and a fresh spec arrives — so this must stay OUT of
-  // the way; taking over would fight the kernel and serve stale columns. It engages ONLY where there is
-  // no kernel to ask, which is exactly what `Slate.isLive()` reports (a static export mirrors it as a
-  // constant `false`). One flag, one behaviour difference, everything else identical.
-  function isLive() {
-    try { return !!(window.Slate && window.Slate.isLive && window.Slate.isLive()); } catch (_) { return false; }
-  }
-
-  // The control that owns a bound variable. Slate marks a rendered control with `data-name`; the actual
-  // input may be that node or sit inside it.
-  function controlInput(name) {
-    var host = document.querySelector('[data-name="' + String(name).replace(/"/g, '\\"') + '"]');
-    if (!host) return null;
-    return (host.matches && host.matches('input,select')) ? host : host.querySelector('input,select');
-  }
-
-  // Which column a control's current value selects. Matched NUMERICALLY against the shipped domain where
-  // both sides are numbers — a DOM control reports "8" as a string, and Julia may have written 8.0, so
-  // comparing text would miss. Falls back to string equality for categorical domains.
-  function domainIndex(domain, raw) {
-    var n = Number(raw);
-    if (!Number.isNaN(n)) {
-      for (var i = 0; i < domain.length; i++) if (Number(domain[i]) === n) return i;
-    }
-    for (var j = 0; j < domain.length; j++) if (String(domain[j]) === String(raw)) return j;
-    return -1;
-  }
-
-  // Slices are stacked along the LAST dimension and the buffer is column-major, so the slice for one
-  // control value is a contiguous run — a view, never a gather, however large the data.
+  // Everything about a replayed control except the call that puts a slice on screen lives in Slate
+  // core, as `Slate.replay` — the sweep lookup, the control lookup, the packed-buffer slice, the
+  // listeners and the enable-once-data-arrives. Core defines it twice on purpose (core.js for a live
+  // page, server_export.jl for a standalone one, the same way `Slate.asset` is mirrored), so this file
+  // does not care which it is running in.
   //
-  // A 1-D slice (a series) goes straight to Plotly. A 2-D slice (a heatmap / surface `z`) has to be
-  // handed over as rows, and column-major means element (r,c) sits at c*rows + r — so this transposes on
-  // the way out rather than shipping a second, row-major copy.
-  function sliceOf(packed, r, i) {
-    var shp = (r.slice && r.slice.length) ? r.slice : [packed.data.length];
-    var n = shp.reduce(function (a, b) { return a * b; }, 1);
-    var flat = packed.data.subarray(i * n, (i + 1) * n);
-    if (shp.length <= 1) return Array.from(flat);
-    if (shp.length === 2) {
-      var rows = shp[0], cols = shp[1], out = new Array(rows);
-      for (var y = 0; y < rows; y++) {
-        var row = new Array(cols);
-        for (var x = 0; x < cols; x++) row[x] = flat[x * rows + y];
-        out[y] = row;
-      }
-      return out;
-    }
-    return Array.from(flat);      // rank ≥ 3 has no direct Plotly field; hand back the flat run
-  }
-
+  // What is left below is the only Plotly-specific part: which trace and field a slice belongs to.
+  // Live, `Slate.replay.wire` returns immediately — moving a `@bind` re-runs the cell in Julia and a
+  // fresh spec arrives, and taking over would fight the kernel and serve stale columns.
   function wireReplay(el, routes) {
-    if (!routes || !routes.length || isLive()) return;
-    routes.forEach(function (r) {
-      var input = controlInput(r.control);
-      if (!input) return;
-      // The route names a SWEEP, not an asset: what shipped — and at what resolution — is the export's
-      // decision, published in this table. A route with no entry simply never wires, so a figure whose
-      // sweep was skipped leaves its control visibly disabled instead of failing at the first drag.
-      var sweep = (window.__slateReplays || {})[r.id];
-      if (!sweep) return;
-      var loaded = window.Slate.asset(sweep.asset);   // inlined bytes in a standalone file
-      var readout = input.parentElement && input.parentElement.querySelector('.exp-ctl-val');
-      var apply = function () {
-        var i = domainIndex(sweep.domain || [], input.value);
-        if (i < 0) return;
-        if (readout) readout.textContent = input.value;
-        loaded.then(function (packed) {
-          var patch = {};
-          patch[r.field] = [sliceOf(packed, sweep, i)];
-          window.Plotly.restyle(el, patch, [r.trace]);
-        }).catch(function (e) { console.error('SlatePlotly replay failed', e); });
-      };
-      // `input` fires continuously while a slider is dragged; the data is already in memory, so redrawing
-      // per event is cheap and gives the same feel as the live kernel path at its best.
-      input.addEventListener('input', apply);
-      input.addEventListener('change', apply);
-      // The export renders every control DISABLED, because one that moves without changing anything reads
-      // as a broken page. Enabling here — and only here — means a control is live exactly when data for
-      // it actually rode along, with no coordination between the two sides.
-      loaded.then(function () {
-        input.disabled = false;
-        input.removeAttribute('title');
-      }).catch(function () { /* data missing → the control stays visibly inert, which is the truth */ });
+    if (!routes || !routes.length) return;
+    if (!window.Slate || !window.Slate.replay) return;   // an export predating `Slate.replay`
+    window.Slate.replay.wire(routes, function (slice, r) {
+      var patch = {};
+      patch[r.field] = [slice];
+      window.Plotly.restyle(el, patch, [r.trace]);
     });
   }
 
@@ -317,6 +407,15 @@
       // it a block with auto margins lines the two engines up, and is a no-op at the default 100%.
       el.style.display = 'block';
       el.style.margin = '0 auto';
+      // Opt into Slate's chart scroll-zoom gate (core `settings.js`). PlotlyBase ships `scrollZoom: true`
+      // in every figure's config, so without this the wheel zooms the plot the moment a reader's cursor
+      // crosses it while scrolling the page — and because the page keeps scrolling under a zoom that is
+      // anchored to the cursor, a single flick reads as the view jittering rather than as a zoom. The gate
+      // holds the wheel back until the figure is clicked into, then scales it by the reader's setting.
+      // The attribute's value names Plotly's own zoom surface: `.nsewdrag`, the transparent rect it lays
+      // over the axes and listens on. (A 3-D figure has no such rect; the gate falls back to the canvas.)
+      el.setAttribute('data-slate-zoomable', '.nsewdrag');
+      el.tabIndex = -1;                                   // focusable, so `:focus-within` can mean "active"
       if (params.height) el.style.height = params.height;
       if (params.width) el.style.width = params.width;
       draw(el, spec, params.spec_json).then(function () {
@@ -339,6 +438,15 @@
     destroy: function (el) {
       try { window.Plotly && window.Plotly.purge(el); } catch (_) {}
       el.__slatePlotlySpec = null;
+      // Both must go with the purge. `purge` takes the event emitter with it, so a node that is wired
+      // again needs to re-register its relayout handler — a stale "already watching" flag would leave the
+      // margin unstabilized for the rest of that figure's life. And the ratchet is only meaningful within
+      // one mounted view: a fresh figure on this node should size to its own labels, not inherit a floor
+      // reserved for data it no longer draws.
+      el.__slateMarginWatched = false;
+      el.__slateMargin = null;
+      el.__slateRemeasuring = false;
+      clearTimeout(el.__slateMarginTimer);      // a measure landing after the purge would throw
     }
   });
 
