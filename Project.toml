@@ -1,7 +1,7 @@
 name = "SlatePlotly"
 uuid = "141e1fc3-13f6-4de8-b22a-97670e9194c6"
 authors = ["Kahli Burke <kahli@kahliburke.com>"]
-version = "0.1.1"
+version = "0.1.2"
 
 [deps]
 Artifacts = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
