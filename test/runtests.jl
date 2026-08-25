@@ -71,6 +71,27 @@ end
 
     # And it is worth real bytes in a file meant to be handed out.
     @test length(_desc(_fig())["props"]["spec_json"]) < 3_000
+
+    # A figure BUILT UP IN STAGES still carries the default. Every non-mutating PlotlyBase combinator
+    # rebuilds the layout and deep-copies the template with it, so the result is equal to the default
+    # but not identical to it — which an identity-only test reads as "the author chose this", keeping a
+    # light template on a dark page. The visible bug: one pale figure among correct ones, in exactly the
+    # notebooks that assemble a plot with `addtraces`.
+    base = _fig()
+    @testset "$name" for (name, derived) in [
+            "addtraces"    => addtraces(base, scatter(x = [1, 2], y = [2, 1])),
+            "copy"         => copy(base),
+            "hcat"         => [base base],
+            "vcat"         => [base; base],
+        ]
+        @test SP._is_default_template(derived)
+        @test !haskey(_spec(derived)["layout"], "template")
+    end
+
+    # The same combinators must NOT launder an authored template away.
+    dark = Plot(scatter(x = [1, 2], y = [3, 4]),
+                Layout(template = PlotlyBase.templates[:plotly_dark]))
+    @test haskey(_spec(addtraces(dark, scatter(x = [1, 2], y = [1, 2])))["layout"], "template")
 end
 
 @testset "bundle selection" begin

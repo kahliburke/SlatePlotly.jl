@@ -183,10 +183,19 @@ _css_len(x::Real) = string(x, "px")
 _css_len(x::AbstractString) = String(x)
 
 # Whether this figure's layout carries the AMBIENT DEFAULT template rather than one the author chose.
-# PlotlyBase stamps every `Layout` with `templates[templates.default]`, so presence proves nothing — but it
-# stores that exact object, so identity separates the two cases with no heuristic.
-_is_default_template(p::PlotlyBase.Plot) =
-    get(p.layout.fields, :template, nothing) === PlotlyBase.templates[PlotlyBase.templates.default]
+# PlotlyBase stamps every `Layout` with `templates[templates.default]`, so presence proves nothing.
+# Identity catches the common case for free, but it is NOT sufficient: every non-mutating PlotlyBase
+# combinator — `addtraces`, `deletetraces`, `movetraces`, `copy` — rebuilds the layout and deep-copies
+# the template with it, so a figure assembled that way carries an EQUAL-but-not-IDENTICAL default and
+# silently reads as author-chosen. The visible symptom is a light-themed figure sitting among dark ones,
+# in exactly the notebooks that build a plot up in stages. Fall back to `==`, which PlotlyBase defines
+# structurally over the template's `data`/`layout`.
+function _is_default_template(p::PlotlyBase.Plot)
+    t = get(p.layout.fields, :template, nothing)
+    t === nothing && return false
+    dflt = PlotlyBase.templates[PlotlyBase.templates.default]
+    return t === dflt || t == dflt
+end
 
 # The figure as a plain spec: `{data, layout, frames, config}`.
 function _spec(p::PlotlyBase.Plot)
