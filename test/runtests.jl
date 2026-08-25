@@ -184,17 +184,29 @@ end
     # anything until it is used.
     @test _desc(_fig())["props"]["replay"] == Any[]
 
-    # Slices are stacked along the LAST dimension and the buffer is column-major, so one control value is
-    # a contiguous run — the client takes a view, never a gather, however large the data.
-    @test occursin("subarray", js)
-    # A 2-D slice (a heatmap `z`) must be handed to Plotly as ROWS; column-major means (r,c) sits at
-    # c*rows + r, so it transposes on the way out rather than shipping a second copy.
-    @test occursin("x * rows + y", js)
-    # It only takes over where there is no kernel — live, Julia recomputes and this must stay out of it.
-    @test occursin("isLive()", js)
+    # The sweep lookup, the packed-buffer slice, the live-vs-export split and the enable-once-data-arrives
+    # all live in core as `Slate.replay` (mirrored by core.js live and server_export.jl standalone). This
+    # package's whole share is knowing WHICH trace and field a slice belongs to, and the Plotly call that
+    # puts it on screen — so that, and not core's internals, is what there is to pin here.
+    @test occursin("Slate.replay", js)
     @test occursin("Plotly.restyle", js)
-    # The export renders controls disabled; enabling is the client's job, and only for what it can drive.
-    @test occursin("input.disabled = false", js)
+    @test occursin(r"patch\[r\.field\]", js)
+    @test occursin(r"\[r\.trace\]", js)
+    # A figure with no routes must not reach for core at all, so a plain notebook pays nothing.
+    @test occursin(r"if \(!routes \|\| !routes\.length\) return", js)
+    # And it must degrade rather than throw in an export written before core grew `Slate.replay`.
+    @test occursin(r"!window\.Slate\.replay.*return", js)
+
+    # Routing itself is this package's job, and is asserted on the DESCRIPTOR rather than the JS: a
+    # replayed value must come back as the (trace, field) pair the widget above indexes with.
+    let rp = SP.ReplayArray([3.0, 4.0], "sweep-1", "w", 1, Any[1, 2]),
+        fig = Plot([scatter(x = [1, 2], y = [3, 4]),
+                    scatter(x = [1, 2], y = rp)])
+        routes = _desc(fig)["props"]["replay"]
+        @test length(routes) == 1
+        @test routes[1]["trace"] == 1          # 0-based: the SECOND trace, since only JS reads this
+        @test routes[1]["field"] == "y"
+    end
 end
 
 @testset "theme contract" begin
